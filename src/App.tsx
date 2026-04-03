@@ -15,7 +15,10 @@ import {
   ListTodo, 
   HelpCircle,
   History,
-  Plus
+  Plus,
+  Check,
+  CheckCheck,
+  Send
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -88,6 +91,29 @@ const Card = ({ children, className }: { children: React.ReactNode; className?: 
   </div>
 );
 
+const Tooltip = ({ children, text }: { children: React.ReactNode; text: string }) => {
+  const [isVisible, setIsVisible] = useState(false);
+
+  return (
+    <div className="relative inline-block" onMouseEnter={() => setIsVisible(true)} onMouseLeave={() => setIsVisible(false)}>
+      {children}
+      <AnimatePresence>
+        {isVisible && (
+          <motion.div
+            initial={{ opacity: 0, y: 5, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 5, scale: 0.95 }}
+            className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-gray-900 text-white text-[10px] font-medium rounded whitespace-nowrap z-50 pointer-events-none shadow-lg"
+          >
+            {text}
+            <div className="absolute top-full left-1/2 -translate-x-1/2 -mt-1 border-4 border-transparent border-t-gray-900" />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
 // --- Error Handling ---
 
 enum OperationType {
@@ -123,6 +149,10 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 
 // --- Main App ---
 
+import { io, Socket } from "socket.io-client";
+
+// ... existing types ...
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -133,11 +163,163 @@ export default function App() {
   const [processingMessage, setProcessingMessage] = useState('Analyzing with Gemini...');
   const [selectedNote, setSelectedNote] = useState<VoiceNote | null>(null);
   
+  // WhatsApp State
+  const [whatsappStatus, setWhatsappStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [whatsappQR, setWhatsappQR] = useState<string | null>(null);
+  const [sentMessages, setSentMessages] = useState<{ [id: string]: { status: number, text: string } }>({});
+  const socketRef = useRef<Socket | null>(null);
+
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const noteRefs = useRef<{ [key: string]: HTMLButtonElement | null }>({});
+
+  // WhatsApp Socket Connection
+  useEffect(() => {
+    if (!user) return;
+
+    const socket = io(window.location.origin);
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('Socket connected:', socket.id);
+      socket.emit('ping');
+    });
+
+    socket.on('pong', () => {
+      console.log('Socket pong received');
+    });
+
+    socket.on('connect_error', (err) => {
+      console.error('Socket connection error:', err);
+    });
+
+    socket.emit('init-whatsapp', user.uid);
+
+    socket.on('whatsapp-qr', (qr: string) => {
+      setWhatsappQR(qr);
+      setWhatsappStatus('disconnected');
+    });
+
+    socket.on('whatsapp-status', (status: 'connected' | 'disconnected') => {
+      setWhatsappStatus(status === 'connected' ? 'connected' : 'disconnected');
+      if (status === 'connected') setWhatsappQR(null);
+    });
+
+    socket.on('whatsapp-message-sent', (data: { success: boolean, id: string, text: string }) => {
+      if (data.success) {
+        setSentMessages(prev => ({ ...prev, [data.id]: { status: 1, text: data.text } }));
+      }
+    });
+
+    socket.on('whatsapp-message-update', (data: { id: string, status: number }) => {
+      setSentMessages(prev => {
+        if (prev[data.id]) {
+          return { ...prev, [data.id]: { ...prev[data.id], status: data.status } };
+        }
+        return prev;
+      });
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [user]);
+
+  // Pending Transcriptions Listener (Automation)
+  useEffect(() => {
+    if (!user) return;
+
+    const path = 'pending_transcriptions';
+    const q = query(
+      collection(db, path),
+      where('userId', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(q, async (snapshot) => {
+      for (const docChange of snapshot.docChanges()) {
+        if (docChange.type === 'added') {
+          const data = docChange.doc.data();
+          const docId = docChange.doc.id;
+          
+          // Process automatically
+          await processPendingTranscription(docId, data.audioBase64, data.mimeType, data.filename, data.remoteJid);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  const processPendingTranscription = async (docId: string, base64: string, mimeType: string, filename: string, remoteJid?: string) => {
+    if (!user) return;
+    setIsProcessing(true);
+    setProcessingMessage('Processing WhatsApp Voice Note...');
+    
+    try {
+      // Call Gemini
+      const result = await processAudioWithGemini(base64, mimeType);
+      
+      // Save to Voice Notes
+      const path = 'voice_notes';
+      await addDoc(collection(db, path), {
+        userId: user.uid,
+        remoteJid: remoteJid || null,
+        filename: filename,
+        transcript: result.transcript,
+        insights: result.insights,
+        createdAt: new Date().toISOString()
+      });
+
+      // Delete from Pending
+      await deleteDoc(doc(db, 'pending_transcriptions', docId));
+      
+      setIsProcessing(false);
+    } catch (error) {
+      console.error('Error processing pending transcription:', error);
+      setIsProcessing(false);
+    }
+  };
+
+  const sendToWhatsApp = (text: string) => {
+    if (!user || !selectedNote?.remoteJid || !socketRef.current) return;
+    
+    socketRef.current.emit('send-whatsapp-message', {
+      userId: user.uid,
+      remoteJid: selectedNote.remoteJid,
+      text
+    });
+  };
+
+  const reconnectWhatsApp = () => {
+    if (user && socketRef.current) {
+      setWhatsappQR(null);
+      setWhatsappStatus('connecting');
+      socketRef.current.emit('init-whatsapp', user.uid);
+    }
+  };
+
+  const resetWhatsApp = () => {
+    if (user && socketRef.current) {
+      if (window.confirm("Are you sure you want to reset your WhatsApp session? You will need to scan the QR code again.")) {
+        setWhatsappQR(null);
+        setWhatsappStatus('disconnected');
+        socketRef.current.emit('reset-whatsapp', user.uid);
+      }
+    }
+  };
+
+  // Scroll to selected note
+  useEffect(() => {
+    if (selectedNote && noteRefs.current[selectedNote.id]) {
+      noteRefs.current[selectedNote.id]?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+      });
+    }
+  }, [selectedNote]);
 
   // Dynamic Loading Messages
   useEffect(() => {
@@ -332,6 +514,11 @@ export default function App() {
     }
   };
 
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    // Optional: Add a temporary toast or visual feedback
+  };
+
   const deleteNote = async (id: string) => {
     if (!confirm('Are you sure you want to delete this note?')) return;
     const path = `voice_notes/${id}`;
@@ -424,16 +611,20 @@ export default function App() {
           </div>
           
           <div className="flex items-center space-x-4">
-            <Button variant="ghost" onClick={exportToCSV} disabled={voiceNotes.length === 0} className="hidden sm:flex">
-              <Download className="w-4 h-4 mr-2" />
-              Export CSV
-            </Button>
+            <Tooltip text="Download history as CSV">
+              <Button variant="ghost" onClick={exportToCSV} disabled={voiceNotes.length === 0} className="hidden sm:flex">
+                <Download className="w-4 h-4 mr-2" />
+                Export CSV
+              </Button>
+            </Tooltip>
             <div className="h-8 w-px bg-gray-200 hidden sm:block"></div>
             <div className="flex items-center space-x-3">
               <img src={user.photoURL || ''} alt="" className="w-8 h-8 rounded-full border border-gray-200" />
-              <Button variant="ghost" onClick={handleLogout} className="p-2">
-                <LogOut className="w-5 h-5" />
-              </Button>
+              <Tooltip text="Sign out">
+                <Button variant="ghost" onClick={handleLogout} className="p-2">
+                  <LogOut className="w-5 h-5" />
+                </Button>
+              </Tooltip>
             </div>
           </div>
         </div>
@@ -495,17 +686,87 @@ export default function App() {
                   accept="audio/*"
                   className="hidden"
                 />
-                <Button 
-                  variant="secondary" 
-                  className="w-full bg-indigo-500/20 border-indigo-400/30 text-white hover:bg-indigo-500/40"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={isRecording || isProcessing}
-                >
-                  <Download className="w-4 h-4 mr-2 rotate-180" />
-                  Upload Audio File
-                </Button>
+                <Tooltip text="Analyze an existing audio file">
+                  <Button 
+                    variant="secondary" 
+                    className="w-full bg-indigo-500/20 border-indigo-400/30 text-white hover:bg-indigo-500/40"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isRecording || isProcessing}
+                  >
+                    <Download className="w-4 h-4 mr-2 rotate-180" />
+                    Upload Audio File
+                  </Button>
+                </Tooltip>
               </div>
             </div>
+          </Card>
+
+  // WhatsApp Sync Section
+  <Card className="p-4 bg-indigo-900 text-white border-none shadow-lg">
+    <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-col">
+        <h3 className="text-xs font-bold uppercase tracking-wider opacity-80">WhatsApp Sync</h3>
+        <div className="flex items-center mt-1">
+          <div className={cn(
+            "w-2 h-2 rounded-full mr-1.5",
+            whatsappStatus === 'connected' ? "bg-green-400 animate-pulse" : (whatsappStatus === 'connecting' ? "bg-yellow-400 animate-pulse" : "bg-red-400")
+          )} />
+          <span className="text-[10px] uppercase font-medium">
+            {whatsappStatus}
+          </span>
+        </div>
+      </div>
+      <MessageSquare className="w-5 h-5 opacity-50" />
+    </div>
+
+    {whatsappStatus !== 'connected' && (
+      <div className="space-y-3">
+        {whatsappStatus === 'connecting' ? (
+          <div className="py-8 text-center bg-white/10 rounded-lg">
+            <Loader2 className="w-8 h-8 animate-spin mx-auto text-indigo-200" />
+            <p className="text-[10px] text-indigo-200 mt-3 font-medium">Establishing secure connection...</p>
+          </div>
+        ) : whatsappQR ? (
+          <div className="bg-white p-2 rounded-lg flex flex-col items-center">
+            <img src={whatsappQR} alt="WhatsApp QR Code" className="w-32 h-32" />
+            <p className="text-[10px] text-gray-500 mt-2 text-center font-medium">
+              Scan with WhatsApp to link your account
+            </p>
+            <button 
+              onClick={reconnectWhatsApp}
+              className="mt-2 text-[10px] text-indigo-600 font-bold hover:underline"
+            >
+              Refresh QR
+            </button>
+          </div>
+        ) : (
+          <div className="py-4 text-center">
+            <Loader2 className="w-6 h-6 animate-spin mx-auto opacity-50" />
+            <p className="text-[10px] opacity-50 mt-2">Generating QR Code...</p>
+            <button 
+              onClick={reconnectWhatsApp}
+              className="mt-2 text-[10px] text-indigo-300 font-bold hover:underline"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+      </div>
+    )}
+
+            {whatsappStatus === 'connected' && (
+              <div className="space-y-3">
+                <p className="text-xs opacity-70 leading-relaxed">
+                  Your account is linked. New voice notes will be automatically transcribed and analyzed.
+                </p>
+                <button 
+                  onClick={resetWhatsApp}
+                  className="text-[10px] text-red-300 font-bold hover:underline"
+                >
+                  Disconnect Account
+                </button>
+              </div>
+            )}
           </Card>
 
           {/* List Card */}
@@ -532,12 +793,20 @@ export default function App() {
               ) : (
                 <div className="divide-y divide-gray-100">
                   {voiceNotes.map((note) => (
-                    <button
+                    <div
                       key={note.id}
+                      ref={(el) => (noteRefs.current[note.id] = el)}
                       onClick={() => setSelectedNote(note)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          setSelectedNote(note);
+                        }
+                      }}
                       className={cn(
-                        "w-full p-4 text-left hover:bg-gray-50 transition-colors flex items-center justify-between group",
-                        selectedNote?.id === note.id && "bg-indigo-50 hover:bg-indigo-50"
+                        "w-full p-4 text-left hover:bg-gray-50 transition-colors flex items-center justify-between group cursor-pointer outline-none focus:bg-gray-50",
+                        selectedNote?.id === note.id && "bg-indigo-50 hover:bg-indigo-50 focus:bg-indigo-50"
                       )}
                     >
                       <div className="flex items-center space-x-3 overflow-hidden">
@@ -559,11 +828,26 @@ export default function App() {
                           </p>
                         </div>
                       </div>
-                      <ChevronRight className={cn(
-                        "w-4 h-4 transition-transform",
-                        selectedNote?.id === note.id ? "text-indigo-400 translate-x-1" : "text-gray-300 group-hover:translate-x-1"
-                      )} />
-                    </button>
+                      <div className="flex items-center space-x-2">
+                        <div className="opacity-0 group-hover:opacity-100 transition-opacity">
+                          <Tooltip text="Delete recording">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deleteNote(note.id);
+                              }}
+                              className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </Tooltip>
+                        </div>
+                        <ChevronRight className={cn(
+                          "w-4 h-4 transition-transform",
+                          selectedNote?.id === note.id ? "text-indigo-400 translate-x-1" : "text-gray-300 group-hover:translate-x-1"
+                        )} />
+                      </div>
+                    </div>
                   ))}
                 </div>
               )}
@@ -584,9 +868,11 @@ export default function App() {
               >
                 <div className="flex items-center justify-between">
                   <h2 className="text-2xl font-bold text-gray-900">{selectedNote.filename}</h2>
-                  <Button variant="ghost" onClick={() => deleteNote(selectedNote.id)} className="text-red-500 hover:text-red-600 hover:bg-red-50">
-                    <Trash2 className="w-5 h-5" />
-                  </Button>
+                  <Tooltip text="Delete this note">
+                    <Button variant="ghost" onClick={() => deleteNote(selectedNote.id)} className="text-red-500 hover:text-red-600 hover:bg-red-50">
+                      <Trash2 className="w-5 h-5" />
+                    </Button>
+                  </Tooltip>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -645,11 +931,58 @@ export default function App() {
                         Suggested Replies
                       </h3>
                       <div className="space-y-3">
-                        {selectedNote.insights.suggested_replies.map((reply, i) => (
-                          <div key={i} className="bg-white p-3 rounded-lg border border-indigo-100 text-gray-700 text-sm shadow-sm">
-                            {reply}
-                          </div>
-                        ))}
+                        {selectedNote.insights.suggested_replies.map((reply, i) => {
+                          // Find if this reply was sent
+                          const sentMsgId = Object.keys(sentMessages).find(id => sentMessages[id].text === reply);
+                          const status = sentMsgId ? sentMessages[sentMsgId].status : 0;
+
+                          return (
+                            <div key={i} className="bg-white p-3 rounded-lg border border-indigo-100 text-gray-700 text-sm shadow-sm group/reply relative">
+                              {reply}
+                              <div className="absolute top-2 right-2 flex items-center space-x-1 opacity-0 group-hover/reply:opacity-100 transition-opacity">
+                                <Tooltip text="Copy to clipboard">
+                                  <button 
+                                    onClick={() => copyToClipboard(reply)}
+                                    className="p-1.5 bg-indigo-50 text-indigo-600 rounded-md hover:bg-indigo-100"
+                                  >
+                                    <Download className="w-3.5 h-3.5 rotate-180" />
+                                  </button>
+                                </Tooltip>
+                                
+                                {selectedNote.remoteJid && (
+                                  <Tooltip text={status > 0 ? "Message Status" : "Send to WhatsApp"}>
+                                    <button 
+                                      onClick={() => sendToWhatsApp(reply)}
+                                      disabled={status > 0}
+                                      className={cn(
+                                        "p-1.5 rounded-md transition-colors",
+                                        status === 0 ? "bg-green-50 text-green-600 hover:bg-green-100" : "bg-gray-50 text-gray-400"
+                                      )}
+                                    >
+                                      {status === 0 && <Send className="w-3.5 h-3.5" />}
+                                      {status === 1 && <Check className="w-3.5 h-3.5" />}
+                                      {status === 2 && <Check className="w-3.5 h-3.5" />}
+                                      {status === 3 && <CheckCheck className="w-3.5 h-3.5" />}
+                                      {status === 4 && <CheckCheck className="w-3.5 h-3.5 text-blue-500" />}
+                                      {status === 5 && <CheckCheck className="w-3.5 h-3.5 text-blue-500" />}
+                                    </button>
+                                  </Tooltip>
+                                )}
+                              </div>
+                              
+                              {status > 0 && (
+                                <div className="mt-2 flex items-center text-[10px] text-gray-400">
+                                  <span className="mr-1">Status:</span>
+                                  {status === 1 && "Sent"}
+                                  {status === 2 && "Sent"}
+                                  {status === 3 && "Delivered"}
+                                  {status === 4 && "Read"}
+                                  {status === 5 && "Read"}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </Card>
                   </div>

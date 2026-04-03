@@ -8,6 +8,7 @@ export interface AudioInsights {
 export interface VoiceNote {
   id: string;
   userId: string;
+  remoteJid?: string; // The WhatsApp JID of the sender
   filename: string;
   transcript: string;
   insights: AudioInsights;

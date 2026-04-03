@@ -10,6 +10,7 @@ service cloud.firestore {
     // Fields:
     //   - id: string (required)
     //   - userId: string (required, immutable)
+    //   - remoteJid: string (optional)
     //   - filename: string (required)
     //   - transcript: string (required)
     //   - insights: map (required)
@@ -27,6 +28,23 @@ service cloud.firestore {
     //   - displayName: string (required)
     //   - photoURL: string (required)
     //   - role: string (required, 'user' or 'admin')
+    //
+    // Collection: whatsapp_sessions
+    // Document ID: userId
+    // Fields:
+    //   - userId: string (required)
+    //   - sessionData: string (required)
+    //   - updatedAt: string (required)
+    //
+    // Collection: pending_transcriptions
+    // Document ID: auto-generated
+    // Fields:
+    //   - userId: string (required)
+    //   - remoteJid: string (optional)
+    //   - audioBase64: string (required)
+    //   - mimeType: string (required)
+    //   - filename: string (required)
+    //   - createdAt: string (required)
     //
     // ===============================================================
 
@@ -63,6 +81,7 @@ service cloud.firestore {
     // ===============================================================
     function isValidVoiceNote(data) {
       return data.userId is string &&
+             (data.remoteJid == null || data.remoteJid is string) &&
              data.filename is string && data.filename.size() < 255 &&
              data.transcript is string && data.transcript.size() < 100000 &&
              data.insights is map &&
@@ -81,20 +100,35 @@ service cloud.firestore {
              data.role in ['user', 'admin'];
     }
 
+    function isValidWhatsAppSession(data) {
+      return data.userId is string &&
+             data.sessionData is string &&
+             data.updatedAt is string;
+    }
+
+    function isValidPendingTranscription(data) {
+      return data.userId is string &&
+             (data.remoteJid == null || data.remoteJid is string) &&
+             data.audioBase64 is string &&
+             data.mimeType is string &&
+             data.filename is string &&
+             data.createdAt is string;
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
 
     match /voice_notes/{noteId} {
-      allow read: if isDocOwner() || isAdmin();
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
       allow create: if isAuthenticated() && 
                       isValidVoiceNote(request.resource.data) && 
                       request.resource.data.userId == request.auth.uid;
-      allow update: if isDocOwner() && 
+      allow update: if isAuthenticated() && (resource.data.userId == request.auth.uid) && 
                       isValidVoiceNote(request.resource.data) && 
                       areImmutableFieldsUnchanged(['userId', 'createdAt']) || 
                       isAdmin();
-      allow delete: if isDocOwner() || isAdmin();
+      allow delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
     }
 
     match /users/{userId} {
@@ -108,6 +142,20 @@ service cloud.firestore {
                       isOwner(userId) && 
                       request.resource.data.role == resource.data.role || 
                       isAdmin();
+    }
+
+    match /whatsapp_sessions/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow write: if isOwner(userId) || isAdmin();
+    }
+
+    match /pending_transcriptions/{transcriptionId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && 
+                      isValidPendingTranscription(request.resource.data) && 
+                      (request.resource.data.userId == request.auth.uid || isAdmin());
+      allow delete: if isAuthenticated() && 
+                      (resource.data.userId == request.auth.uid || isAdmin());
     }
   }
 }

@@ -7,6 +7,7 @@
       "properties": {
         "id": { "type": "string" },
         "userId": { "type": "string" },
+        "remoteJid": { "type": "string", "description": "The WhatsApp JID of the sender." },
         "filename": { "type": "string" },
         "transcript": { "type": "string" },
         "insights": {
@@ -34,6 +35,31 @@
         "role": { "type": "string", "enum": ["user", "admin"] }
       },
       "required": ["uid", "email", "displayName", "photoURL", "role"]
+    },
+    "WhatsAppSession": {
+      "title": "WhatsApp Session",
+      "description": "Stores WhatsApp authentication data for persistence.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "sessionData": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "sessionData", "updatedAt"]
+    },
+    "PendingTranscription": {
+      "title": "Pending Transcription",
+      "description": "Audio received from WhatsApp waiting for transcription.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "remoteJid": { "type": "string" },
+        "audioBase64": { "type": "string" },
+        "mimeType": { "type": "string" },
+        "filename": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "audioBase64", "mimeType", "filename", "createdAt"]
     }
   },
   "firestore": {
@@ -44,6 +70,14 @@
     "/users/{userId}": {
       "schema": "UserProfile",
       "description": "User profile documents."
+    },
+    "/whatsapp_sessions/{userId}": {
+      "schema": "WhatsAppSession",
+      "description": "Stores encrypted WhatsApp session data."
+    },
+    "/pending_transcriptions/{transcriptionId}": {
+      "schema": "PendingTranscription",
+      "description": "Queue for incoming WhatsApp audio messages."
     }
   }
 }
