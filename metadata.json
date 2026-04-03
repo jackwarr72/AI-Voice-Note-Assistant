@@ -1,0 +1,7 @@
+{
+  "name": "AI Voice Note Assistant",
+  "description": "Transform your voice notes into structured insights, summaries, and actionable tasks using Gemini AI.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

@@ -1,0 +1,113 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: voice_notes
+    // Document ID: auto-generated
+    // Fields:
+    //   - id: string (required)
+    //   - userId: string (required, immutable)
+    //   - filename: string (required)
+    //   - transcript: string (required)
+    //   - insights: map (required)
+    //     - summary: string
+    //     - key_points: list of strings
+    //     - questions: list of strings
+    //     - suggested_replies: list of strings
+    //   - createdAt: string (required, immutable)
+    //
+    // Collection: users
+    // Document ID: userId
+    // Fields:
+    //   - uid: string (required)
+    //   - email: string (required)
+    //   - displayName: string (required)
+    //   - photoURL: string (required)
+    //   - role: string (required, 'user' or 'admin')
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+    function isAdmin() {
+      return isAuthenticated() &&
+        ((exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+          (request.auth.token.email == "jackwarr72@gmail.com" && request.auth.token.email_verified == true));
+    }
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidVoiceNote(data) {
+      return data.userId is string &&
+             data.filename is string && data.filename.size() < 255 &&
+             data.transcript is string && data.transcript.size() < 100000 &&
+             data.insights is map &&
+             data.insights.summary is string &&
+             data.insights.key_points is list &&
+             data.insights.questions is list &&
+             data.insights.suggested_replies is list &&
+             data.createdAt is string;
+    }
+
+    function isValidUser(data) {
+      return data.uid is string &&
+             data.email is string && isValidEmail(data.email) &&
+             data.displayName is string &&
+             data.photoURL is string &&
+             data.role in ['user', 'admin'];
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /voice_notes/{noteId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && 
+                      isValidVoiceNote(request.resource.data) && 
+                      request.resource.data.userId == request.auth.uid;
+      allow update: if isDocOwner() && 
+                      isValidVoiceNote(request.resource.data) && 
+                      areImmutableFieldsUnchanged(['userId', 'createdAt']) || 
+                      isAdmin();
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && 
+                      isValidUser(request.resource.data) && 
+                      isOwner(userId) && 
+                      request.resource.data.role == 'user';
+      allow update: if isAuthenticated() && 
+                      isValidUser(request.resource.data) && 
+                      isOwner(userId) && 
+                      request.resource.data.role == resource.data.role || 
+                      isAdmin();
+    }
+  }
+}

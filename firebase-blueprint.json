@@ -1,0 +1,49 @@
+{
+  "entities": {
+    "VoiceNote": {
+      "title": "Voice Note",
+      "description": "A processed voice note with transcription and insights.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "filename": { "type": "string" },
+        "transcript": { "type": "string" },
+        "insights": {
+          "type": "object",
+          "properties": {
+            "summary": { "type": "string" },
+            "key_points": { "type": "array", "items": { "type": "string" } },
+            "questions": { "type": "array", "items": { "type": "string" } },
+            "suggested_replies": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "filename", "transcript", "insights", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User profile information.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "admin"] }
+      },
+      "required": ["uid", "email", "displayName", "photoURL", "role"]
+    }
+  },
+  "firestore": {
+    "/voice_notes/{noteId}": {
+      "schema": "VoiceNote",
+      "description": "Collection of processed voice notes."
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile documents."
+    }
+  }
+}
