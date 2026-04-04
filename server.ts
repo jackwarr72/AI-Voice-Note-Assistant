@@ -41,13 +41,18 @@ async function startServer() {
   const app = express();
   const httpServer = createHttpServer(app);
   const io = new SocketServer(httpServer, {
-    cors: { origin: "*" }
+    cors: { origin: "*" },
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    allowEIO3: true
   });
 
   const PORT = 3000;
 
   // WhatsApp Session Management
   const sessions = new Map<string, any>();
+  const sessionStatus = new Map<string, 'connected' | 'disconnected' | 'connecting'>();
+  const sessionQR = new Map<string, string>();
 
   // Custom Firestore Auth State for Baileys
   async function getFirestoreAuthState(userId: string) {
@@ -58,22 +63,13 @@ async function startServer() {
     return useMultiFileAuthState(sessionDir);
   }
 
-  async function connectToWhatsApp(userId: string, socket: any) {
-    // Close existing session if any to prevent multiple concurrent connections
-    const existingSock = sessions.get(userId);
-    if (existingSock) {
-      console.log(`Closing existing WhatsApp session for ${userId}`);
-      try {
-        existingSock.ev.removeAllListeners("connection.update");
-        existingSock.ev.removeAllListeners("creds.update");
-        existingSock.ev.removeAllListeners("messages.upsert");
-        existingSock.ev.removeAllListeners("messages.update");
-        existingSock.end(new Error("New connection requested"));
-      } catch (err) {
-        console.error("Error closing existing session:", err);
-      }
+  async function connectToWhatsApp(userId: string) {
+    if (sessionStatus.get(userId) === 'connecting' || sessionStatus.get(userId) === 'connected') {
+      console.log(`WhatsApp for ${userId} is already ${sessionStatus.get(userId)}`);
+      return;
     }
 
+    sessionStatus.set(userId, 'connecting');
     console.log(`Connecting to WhatsApp for ${userId}...`);
     
     let state, saveCreds;
@@ -83,7 +79,8 @@ async function startServer() {
       saveCreds = authResult.saveCreds;
     } catch (err) {
       console.error("Error getting auth state:", err);
-      socket.emit("whatsapp-status", "error");
+      sessionStatus.set(userId, 'disconnected');
+      io.to(`whatsapp:${userId}`).emit("whatsapp-status", "disconnected");
       return;
     }
 
@@ -116,7 +113,8 @@ async function startServer() {
         console.log(`QR code generated for user ${userId}`);
         try {
           const qrDataUrl = await QRCode.toDataURL(qr);
-          socket.emit("whatsapp-qr", qrDataUrl);
+          sessionQR.set(userId, qrDataUrl);
+          io.to(`whatsapp:${userId}`).emit("whatsapp-qr", qrDataUrl);
         } catch (err) {
           console.error("Error generating QR Data URL:", err);
         }
@@ -125,14 +123,20 @@ async function startServer() {
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
         console.log(`WhatsApp connection closed for ${userId}. Status: ${statusCode}`);
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        socket.emit("whatsapp-status", "disconnected");
+        
+        sessionStatus.set(userId, 'disconnected');
+        io.to(`whatsapp:${userId}`).emit("whatsapp-status", "disconnected");
+        
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.connectionReplaced;
+        
         if (shouldReconnect) {
-          console.log(`Reconnecting WhatsApp for ${userId}...`);
-          connectToWhatsApp(userId, socket);
+          console.log(`Reconnecting WhatsApp for ${userId} in 5s...`);
+          setTimeout(() => connectToWhatsApp(userId), 5000);
         }
       } else if (connection === "open") {
-        socket.emit("whatsapp-status", "connected");
+        sessionStatus.set(userId, 'connected');
+        sessionQR.delete(userId);
+        io.to(`whatsapp:${userId}`).emit("whatsapp-status", "connected");
         console.log(`WhatsApp connected for user ${userId}`);
       }
     });
@@ -144,31 +148,42 @@ async function startServer() {
       if (!msg.message || msg.key.fromMe) return;
 
       const audioMsg = msg.message.audioMessage;
-      const isVoiceNote = audioMsg?.ptt === true;
+      const isVoiceNote = audioMsg?.ptt === true || audioMsg?.mimetype?.includes("audio/ogg");
 
-      if (isVoiceNote && audioMsg) {
-        console.log("Received voice note from WhatsApp");
-        try {
-          const buffer = await downloadMediaMessage(msg, "buffer", {});
-          const base64Audio = buffer.toString("base64");
-          
-          // Save to Pending Transcriptions in Firestore
+      if (audioMsg) {
+        console.log(`Received audio message from WhatsApp. PTT: ${audioMsg.ptt}, MimeType: ${audioMsg.mimetype}`);
+        
+        if (isVoiceNote) {
+          console.log("Processing as voice note...");
           try {
-            await db.collection("pending_transcriptions").add({
-              userId,
-              remoteJid: msg.key.remoteJid,
-              audioBase64: base64Audio,
-              mimeType: audioMsg.mimetype || "audio/ogg",
-              filename: `WhatsApp Voice Note (${new Date().toLocaleString()})`,
-              createdAt: new Date().toISOString()
-            });
-            socket.emit("new-whatsapp-audio", { success: true });
-          } catch (dbErr) {
-            console.error("Firestore Error (pending_transcriptions):", dbErr);
-            socket.emit("new-whatsapp-audio", { success: false, error: dbErr.message });
+            const buffer = await downloadMediaMessage(msg, "buffer", {});
+            const base64Audio = buffer.toString("base64");
+            
+            // Sanitize mimeType for Gemini
+            let mimeType = audioMsg.mimetype || "audio/ogg";
+            if (mimeType.includes(";")) {
+              mimeType = mimeType.split(";")[0].trim();
+            }
+            
+            // Save to Pending Transcriptions in Firestore
+            try {
+              await db.collection("pending_transcriptions").add({
+                userId,
+                remoteJid: msg.key.remoteJid,
+                audioBase64: base64Audio,
+                mimeType: mimeType,
+                filename: `WhatsApp Voice Note (${new Date().toLocaleString()})`,
+                createdAt: new Date().toISOString()
+              });
+              console.log(`Saved pending transcription for user ${userId}`);
+              io.to(`whatsapp:${userId}`).emit("new-whatsapp-audio", { success: true });
+            } catch (dbErr) {
+              console.error("Firestore Error (pending_transcriptions):", dbErr);
+              io.to(`whatsapp:${userId}`).emit("new-whatsapp-audio", { success: false, error: dbErr.message });
+            }
+          } catch (err) {
+            console.error("Error downloading WhatsApp media:", err);
           }
-        } catch (err) {
-          console.error("Error downloading WhatsApp media:", err);
         }
       }
     });
@@ -176,7 +191,7 @@ async function startServer() {
     sock.ev.on("messages.update", (updates) => {
       for (const update of updates) {
         if (update.update.status) {
-          socket.emit("whatsapp-message-update", {
+          io.to(`whatsapp:${userId}`).emit("whatsapp-message-update", {
             id: update.key.id,
             status: update.update.status, // 3 = delivered, 4 = read
             remoteJid: update.key.remoteJid
@@ -196,17 +211,40 @@ async function startServer() {
 
     socket.on("init-whatsapp", (userId: string) => {
       console.log(`Initializing WhatsApp for user: ${userId}`);
-      connectToWhatsApp(userId, socket);
+      socket.join(`whatsapp:${userId}`);
+      
+      const status = sessionStatus.get(userId) || 'disconnected';
+      socket.emit("whatsapp-status", status);
+      
+      if (status === 'disconnected') {
+        connectToWhatsApp(userId);
+      } else if (status === 'connecting' && sessionQR.has(userId)) {
+        socket.emit("whatsapp-qr", sessionQR.get(userId));
+      }
     });
 
     socket.on("reset-whatsapp", (userId: string) => {
       console.log(`Resetting WhatsApp for user: ${userId}`);
+      
+      // Close session if active
+      const sock = sessions.get(userId);
+      if (sock) {
+        try {
+          sock.end(undefined);
+        } catch (e) {}
+        sessions.delete(userId);
+      }
+      
+      sessionStatus.set(userId, 'disconnected');
+      sessionQR.delete(userId);
+      
       const sessionDir = path.join(process.cwd(), "sessions", userId);
       if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
       }
-      socket.emit("whatsapp-status", "disconnected");
-      socket.emit("whatsapp-qr", null);
+      
+      io.to(`whatsapp:${userId}`).emit("whatsapp-status", "disconnected");
+      io.to(`whatsapp:${userId}`).emit("whatsapp-qr", null);
     });
 
     socket.on("send-whatsapp-message", async ({ userId, remoteJid, text }) => {
@@ -214,17 +252,17 @@ async function startServer() {
       if (sock) {
         try {
           const sentMsg = await sock.sendMessage(remoteJid, { text });
-          socket.emit("whatsapp-message-sent", { 
+          io.to(`whatsapp:${userId}`).emit("whatsapp-message-sent", { 
             success: true, 
             id: sentMsg.key.id,
             text 
           });
         } catch (err) {
           console.error("Error sending WhatsApp message:", err);
-          socket.emit("whatsapp-message-sent", { success: false, error: err.message });
+          io.to(`whatsapp:${userId}`).emit("whatsapp-message-sent", { success: false, error: err.message });
         }
       } else {
-        socket.emit("whatsapp-message-sent", { success: false, error: "WhatsApp not connected" });
+        io.to(`whatsapp:${userId}`).emit("whatsapp-message-sent", { success: false, error: "WhatsApp not connected" });
       }
     });
 

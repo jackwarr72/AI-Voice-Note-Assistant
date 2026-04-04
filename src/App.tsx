@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, Component } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Mic, 
   Square, 
@@ -18,7 +18,8 @@ import {
   Plus,
   Check,
   CheckCheck,
-  Send
+  Send,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -37,12 +38,14 @@ import {
   deleteDoc, 
   doc, 
   setDoc,
-  getDoc
+  getDoc,
+  getDocs
 } from 'firebase/firestore';
 import { auth, db, googleProvider } from './firebase';
 import { VoiceNote, AudioInsights } from './types';
 import { processAudioWithGemini } from './lib/gemini';
 import { cn } from './lib/utils';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 // --- Components ---
 
@@ -159,10 +162,15 @@ export default function App() {
   const [voiceNotes, setVoiceNotes] = useState<VoiceNote[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingCount, setProcessingCount] = useState(0);
   const [processingMessage, setProcessingMessage] = useState('Analyzing with Gemini...');
+  const [socketStatus, setSocketStatus] = useState<'connected' | 'disconnected'>('disconnected');
+  const [error, setError] = useState<string | null>(null);
+  const [notification, setNotification] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
+  const processingQueue = useRef<Set<string>>(new Set());
   const [selectedNote, setSelectedNote] = useState<VoiceNote | null>(null);
   
+  const isProcessing = processingCount > 0;
   // WhatsApp State
   const [whatsappStatus, setWhatsappStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
   const [whatsappQR, setWhatsappQR] = useState<string | null>(null);
@@ -180,12 +188,26 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
 
-    const socket = io(window.location.origin);
+    const socket = io({
+      transports: ["polling", "websocket"],
+      reconnectionAttempts: Infinity,
+      timeout: 30000
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => {
       console.log('Socket connected:', socket.id);
+      setSocketStatus('connected');
+      setError(null); // Clear any previous socket errors
       socket.emit('ping');
+      if (user) {
+        socket.emit('init-whatsapp', user.uid);
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Socket disconnected');
+      setSocketStatus('disconnected');
     });
 
     socket.on('pong', () => {
@@ -194,9 +216,13 @@ export default function App() {
 
     socket.on('connect_error', (err) => {
       console.error('Socket connection error:', err);
+      setSocketStatus('disconnected');
+      if (err.message === 'timeout') {
+        setError('Connection timed out. Retrying...');
+      } else {
+        setError(`Socket error: ${err.message}`);
+      }
     });
-
-    socket.emit('init-whatsapp', user.uid);
 
     socket.on('whatsapp-qr', (qr: string) => {
       setWhatsappQR(qr);
@@ -239,15 +265,24 @@ export default function App() {
     );
 
     const unsubscribe = onSnapshot(q, async (snapshot) => {
+      console.log(`Pending transcriptions snapshot received. Count: ${snapshot.size}`);
       for (const docChange of snapshot.docChanges()) {
         if (docChange.type === 'added') {
           const data = docChange.doc.data();
           const docId = docChange.doc.id;
           
+          if (processingQueue.current.has(docId)) continue;
+          
+          console.log(`Processing new pending transcription: ${docId}`);
+          processingQueue.current.add(docId);
+          setProcessingCount(prev => prev + 1);
           // Process automatically
-          await processPendingTranscription(docId, data.audioBase64, data.mimeType, data.filename, data.remoteJid);
+          processPendingTranscription(docId, data.audioBase64, data.mimeType, data.filename, data.remoteJid)
+            .finally(() => setProcessingCount(prev => Math.max(0, prev - 1)));
         }
       }
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, path);
     });
 
     return () => unsubscribe();
@@ -255,31 +290,40 @@ export default function App() {
 
   const processPendingTranscription = async (docId: string, base64: string, mimeType: string, filename: string, remoteJid?: string) => {
     if (!user) return;
-    setIsProcessing(true);
-    setProcessingMessage('Processing WhatsApp Voice Note...');
     
     try {
+      console.log(`Calling Gemini for transcription: ${docId}`);
       // Call Gemini
       const result = await processAudioWithGemini(base64, mimeType);
       
+      console.log(`Gemini transcription successful for ${docId}, saving to voice_notes...`);
       // Save to Voice Notes
       const path = 'voice_notes';
-      await addDoc(collection(db, path), {
-        userId: user.uid,
-        remoteJid: remoteJid || null,
-        filename: filename,
-        transcript: result.transcript,
-        insights: result.insights,
-        createdAt: new Date().toISOString()
-      });
+      try {
+        await addDoc(collection(db, path), {
+          userId: user.uid,
+          remoteJid: remoteJid || null,
+          filename: filename,
+          transcript: result.transcript,
+          insights: result.insights,
+          createdAt: new Date().toISOString()
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.WRITE, path);
+      }
 
+      console.log(`Deleting pending transcription: ${docId}`);
       // Delete from Pending
-      await deleteDoc(doc(db, 'pending_transcriptions', docId));
-      
-      setIsProcessing(false);
+      const pendingPath = 'pending_transcriptions';
+      try {
+        await deleteDoc(doc(db, pendingPath, docId));
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, pendingPath);
+      }
+      processingQueue.current.delete(docId);
     } catch (error) {
       console.error('Error processing pending transcription:', error);
-      setIsProcessing(false);
+      processingQueue.current.delete(docId);
     }
   };
 
@@ -303,11 +347,39 @@ export default function App() {
 
   const resetWhatsApp = () => {
     if (user && socketRef.current) {
-      if (window.confirm("Are you sure you want to reset your WhatsApp session? You will need to scan the QR code again.")) {
-        setWhatsappQR(null);
-        setWhatsappStatus('disconnected');
-        socketRef.current.emit('reset-whatsapp', user.uid);
+      setWhatsappQR(null);
+      setWhatsappStatus('disconnected');
+      socketRef.current.emit('reset-whatsapp', user.uid);
+    }
+  };
+
+  const manualSync = async () => {
+    if (!user) return;
+    setProcessingMessage('Syncing WhatsApp notes...');
+    const path = 'pending_transcriptions';
+    try {
+      const q = query(
+        collection(db, path),
+        where('userId', '==', user.uid)
+      );
+      const snapshot = await getDocs(q);
+      console.log(`Manual sync found ${snapshot.size} pending transcriptions`);
+      
+      if (snapshot.size === 0) {
+        setNotification({ message: 'No pending transcriptions found.', type: 'success' });
+        return;
       }
+
+      for (const docSnap of snapshot.docs) {
+        const data = docSnap.data();
+        if (processingQueue.current.has(docSnap.id)) continue;
+        processingQueue.current.add(docSnap.id);
+        setProcessingCount(prev => prev + 1);
+        processPendingTranscription(docSnap.id, data.audioBase64, data.mimeType, data.filename, data.remoteJid)
+          .finally(() => setProcessingCount(prev => Math.max(0, prev - 1)));
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, path);
     }
   };
 
@@ -320,6 +392,14 @@ export default function App() {
       });
     }
   }, [selectedNote]);
+
+  // Clear notification after 5 seconds
+  useEffect(() => {
+    if (notification) {
+      const timer = setTimeout(() => setNotification(null), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [notification]);
 
   // Dynamic Loading Messages
   useEffect(() => {
@@ -381,8 +461,7 @@ export default function App() {
     const path = 'voice_notes';
     const q = query(
       collection(db, path),
-      where('userId', '==', user.uid),
-      orderBy('createdAt', 'desc')
+      where('userId', '==', user.uid)
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -390,9 +469,15 @@ export default function App() {
         id: doc.id,
         ...doc.data()
       } as VoiceNote));
+      
+      // Sort in memory to avoid the need for a composite index (userId + createdAt)
+      notes.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      
       setVoiceNotes(notes);
+      setLoading(false);
+      setError(null);
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, path);
+      handleFirestoreError(error, OperationType.GET, path);
     });
 
     return () => unsubscribe();
@@ -453,7 +538,7 @@ export default function App() {
       setIsRecording(true);
     } catch (error) {
       console.error('Error starting recording:', error);
-      alert('Could not access microphone. Please check permissions.');
+      setNotification({ message: 'Could not access microphone. Please check permissions.', type: 'error' });
     }
   };
 
@@ -468,7 +553,7 @@ export default function App() {
     const file = event.target.files?.[0];
     if (file) {
       if (!file.type.startsWith('audio/')) {
-        alert('Please upload an audio file.');
+        setNotification({ message: 'Please upload an audio file.', type: 'error' });
         return;
       }
       processAudio(file, file.name);
@@ -479,38 +564,43 @@ export default function App() {
 
   const processAudio = async (blob: Blob, filename: string) => {
     if (!user) return;
-    setIsProcessing(true);
+    setProcessingCount(prev => prev + 1);
     
     try {
       // Convert blob to base64
       const reader = new FileReader();
       reader.readAsDataURL(blob);
       reader.onloadend = async () => {
-        const base64Audio = (reader.result as string).split(',')[1];
-        
-        // Call Gemini
-        const result = await processAudioWithGemini(base64Audio, blob.type);
-        
-        // Save to Firestore
-        const path = 'voice_notes';
         try {
-          await addDoc(collection(db, path), {
-            userId: user.uid,
-            filename: filename,
-            transcript: result.transcript,
-            insights: result.insights,
-            createdAt: new Date().toISOString()
-          });
+          const base64Audio = (reader.result as string).split(',')[1];
+          
+          // Call Gemini
+          const result = await processAudioWithGemini(base64Audio, blob.type);
+          
+          // Save to Firestore
+          const path = 'voice_notes';
+          try {
+            await addDoc(collection(db, path), {
+              userId: user.uid,
+              filename: filename,
+              transcript: result.transcript,
+              insights: result.insights,
+              createdAt: new Date().toISOString()
+            });
+          } catch (error) {
+            handleFirestoreError(error, OperationType.WRITE, path);
+          }
         } catch (error) {
-          handleFirestoreError(error, OperationType.CREATE, path);
+          console.error('Error in processAudio inner:', error);
+          setNotification({ message: 'Failed to process audio. Please try again.', type: 'error' });
+        } finally {
+          setProcessingCount(prev => Math.max(0, prev - 1));
         }
-        
-        setIsProcessing(false);
       };
     } catch (error) {
       console.error('Error processing audio:', error);
-      setIsProcessing(false);
-      alert('Failed to process audio. Please try again.');
+      setProcessingCount(prev => Math.max(0, prev - 1));
+      setNotification({ message: 'Failed to process audio. Please try again.', type: 'error' });
     }
   };
 
@@ -520,7 +610,6 @@ export default function App() {
   };
 
   const deleteNote = async (id: string) => {
-    if (!confirm('Are you sure you want to delete this note?')) return;
     const path = `voice_notes/${id}`;
     try {
       await deleteDoc(doc(db, path));
@@ -599,7 +688,26 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col">
+    <ErrorBoundary>
+      <div className="min-h-screen bg-gray-50 flex flex-col">
+      {/* Notifications */}
+      <AnimatePresence>
+        {notification && (
+          <motion.div
+            initial={{ opacity: 0, y: -50 }}
+            animate={{ opacity: 1, y: 20 }}
+            exit={{ opacity: 0, y: -50 }}
+            className={cn(
+              "fixed top-0 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-full shadow-lg flex items-center space-x-2 text-sm font-medium",
+              notification.type === 'success' ? "bg-green-600 text-white" : "bg-red-600 text-white"
+            )}
+          >
+            {notification.type === 'success' ? <Check className="w-4 h-4" /> : <HelpCircle className="w-4 h-4" />}
+            <span>{notification.message}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Header */}
       <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -611,6 +719,11 @@ export default function App() {
           </div>
           
           <div className="flex items-center space-x-4">
+            <div className={cn(
+              "w-2 h-2 rounded-full",
+              socketStatus === 'connected' ? "bg-green-500" : "bg-red-500"
+            )} title={socketStatus === 'connected' ? "Socket Connected" : "Socket Disconnected"} />
+            
             <Tooltip text="Download history as CSV">
               <Button variant="ghost" onClick={exportToCSV} disabled={voiceNotes.length === 0} className="hidden sm:flex">
                 <Download className="w-4 h-4 mr-2" />
@@ -629,6 +742,15 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {error && (
+        <div className="bg-red-50 border-b border-red-100 p-3">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center space-x-3 text-sm text-red-600">
+            <HelpCircle className="w-4 h-4 shrink-0" />
+            <p className="font-medium">{error}</p>
+          </div>
+        </div>
+      )}
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 flex flex-col lg:flex-row gap-8">
         {/* Left Column: Recording & List */}
@@ -759,12 +881,22 @@ export default function App() {
                 <p className="text-xs opacity-70 leading-relaxed">
                   Your account is linked. New voice notes will be automatically transcribed and analyzed.
                 </p>
-                <button 
-                  onClick={resetWhatsApp}
-                  className="text-[10px] text-red-300 font-bold hover:underline"
-                >
-                  Disconnect Account
-                </button>
+                <div className="flex items-center space-x-3">
+                  <button 
+                    onClick={manualSync}
+                    disabled={isProcessing}
+                    className="text-[10px] text-indigo-300 font-bold hover:underline flex items-center disabled:opacity-50"
+                  >
+                    <RefreshCw className={cn("w-3 h-3 mr-1", isProcessing && "animate-spin")} />
+                    Sync Now
+                  </button>
+                  <button 
+                    onClick={resetWhatsApp}
+                    className="text-[10px] text-red-300 font-bold hover:underline"
+                  >
+                    Disconnect Account
+                  </button>
+                </div>
               </div>
             )}
           </Card>
@@ -823,7 +955,13 @@ export default function App() {
                           )}>
                             {note.filename}
                           </p>
-                          <p className="text-xs text-gray-500">
+                          <p className="text-xs text-gray-500 flex items-center">
+                            {note.remoteJid && (
+                              <span className="inline-flex items-center text-green-600 mr-2 font-bold">
+                                <MessageSquare className="w-3 h-3 mr-0.5" />
+                                WA
+                              </span>
+                            )}
                             {new Date(note.createdAt).toLocaleDateString()} • {new Date(note.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                           </p>
                         </div>
@@ -867,7 +1005,15 @@ export default function App() {
                 className="space-y-6"
               >
                 <div className="flex items-center justify-between">
-                  <h2 className="text-2xl font-bold text-gray-900">{selectedNote.filename}</h2>
+                  <div className="flex items-center space-x-3">
+                    <h2 className="text-2xl font-bold text-gray-900">{selectedNote.filename}</h2>
+                    {selectedNote.remoteJid && (
+                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-800">
+                        <MessageSquare className="w-3 h-3 mr-1" />
+                        WhatsApp
+                      </span>
+                    )}
+                  </div>
                   <Tooltip text="Delete this note">
                     <Button variant="ghost" onClick={() => deleteNote(selectedNote.id)} className="text-red-500 hover:text-red-600 hover:bg-red-50">
                       <Trash2 className="w-5 h-5" />
@@ -950,34 +1096,41 @@ export default function App() {
                                 </Tooltip>
                                 
                                 {selectedNote.remoteJid && (
-                                  <Tooltip text={status > 0 ? "Message Status" : "Send to WhatsApp"}>
+                                  <Tooltip text={
+                                    status === 0 ? "Send to WhatsApp" :
+                                    status === 1 || status === 2 ? "Message Sent" :
+                                    status === 3 ? "Message Delivered" :
+                                    status >= 4 ? "Message Read" : "Unknown Status"
+                                  }>
                                     <button 
                                       onClick={() => sendToWhatsApp(reply)}
                                       disabled={status > 0}
                                       className={cn(
-                                        "p-1.5 rounded-md transition-colors",
-                                        status === 0 ? "bg-green-50 text-green-600 hover:bg-green-100" : "bg-gray-50 text-gray-400"
+                                        "p-1.5 rounded-md transition-all duration-200",
+                                        status === 0 ? "bg-green-50 text-green-600 hover:bg-green-100" : 
+                                        status >= 4 ? "bg-blue-50 text-blue-500" :
+                                        "bg-gray-50 text-gray-400"
                                       )}
                                     >
                                       {status === 0 && <Send className="w-3.5 h-3.5" />}
-                                      {status === 1 && <Check className="w-3.5 h-3.5" />}
-                                      {status === 2 && <Check className="w-3.5 h-3.5" />}
+                                      {(status === 1 || status === 2) && <Check className="w-3.5 h-3.5" />}
                                       {status === 3 && <CheckCheck className="w-3.5 h-3.5" />}
-                                      {status === 4 && <CheckCheck className="w-3.5 h-3.5 text-blue-500" />}
-                                      {status === 5 && <CheckCheck className="w-3.5 h-3.5 text-blue-500" />}
+                                      {status >= 4 && <CheckCheck className="w-3.5 h-3.5" />}
                                     </button>
                                   </Tooltip>
                                 )}
                               </div>
                               
                               {status > 0 && (
-                                <div className="mt-2 flex items-center text-[10px] text-gray-400">
+                                <div className={cn(
+                                  "mt-2 flex items-center text-[10px] font-medium",
+                                  status >= 4 ? "text-blue-500" : "text-gray-400"
+                                )}>
                                   <span className="mr-1">Status:</span>
                                   {status === 1 && "Sent"}
                                   {status === 2 && "Sent"}
                                   {status === 3 && "Delivered"}
-                                  {status === 4 && "Read"}
-                                  {status === 5 && "Read"}
+                                  {status >= 4 && "Read"}
                                 </div>
                               )}
                             </div>
@@ -1013,5 +1166,6 @@ export default function App() {
         </div>
       </main>
     </div>
+    </ErrorBoundary>
   );
 }
